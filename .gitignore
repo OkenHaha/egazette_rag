@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.env
+chroma_dbMD
+chroma_dbJSON.zip
+chromadb_data.txt
+# Virtual environments
+.venv
+result
+results
+result.txt
+chroma_db
