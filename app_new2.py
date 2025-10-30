@@ -14,9 +14,6 @@ import requests
 import certifi
 import urllib3
 
-# Suppress SSL warnings if needed (for testing only)
-# urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # Load environment variables
 load_dotenv()
 
@@ -34,7 +31,7 @@ app.add_middleware(
 # Database configuration
 DB_CONFIG = {
     "host": "localhost",
-    "database": "migrated",
+    "database": "json_embed",
     "user": "postgres",
     "password": "1234",
     "port": 5432
@@ -45,9 +42,12 @@ API_KEY = os.getenv("API_KEY", "").strip()
 BASE_URL = os.getenv("BASE_URL", "https://api.studio.nebius.com/v1/")
 API_MODEL = os.getenv("model", "moonshotai/Kimi-K2-Instruct")
 
+# Jina Reranker Configuration
+JINA_API_KEY = os.getenv("JINA", "").strip()
+USE_RERANKER = bool(JINA_API_KEY)
+
 # Local Ollama Models (fallback)
-#EMBED_MODEL = "qwen3-embedding:8b"
-EMBED_MODEL = "nomic-embed-text:latest"
+EMBED_MODEL = "qwen3-embedding:8b"
 CHAT_MODEL = "gemma3:4b"
 
 # Determine which mode to use
@@ -58,6 +58,7 @@ if USE_API:
     print(f"   Using model: {API_MODEL}")
 else:
     print(f"   Using local models: {CHAT_MODEL} (chat), {EMBED_MODEL} (embeddings)")
+print(f"🔄 Reranker: {'ENABLED' if USE_RERANKER else 'DISABLED'}")
 
 class ChatRequest(BaseModel):
     message: str
@@ -113,6 +114,70 @@ def search_similar_chunks(query_embedding: List[float], top_k: int = 3) -> List[
     finally:
         conn.close()
 
+def rerank_chunks(query: str, chunks: List[Dict], top_n: int = 3) -> List[Dict]:
+    """
+    Rerank chunks using Jina AI reranker API
+    
+    Args:
+        query: The user's query
+        chunks: List of retrieved chunks
+        top_n: Number of top results to return after reranking
+    
+    Returns:
+        Reranked list of chunks
+    """
+    if not USE_RERANKER or not chunks:
+        return chunks[:top_n]
+    
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {JINA_API_KEY}"
+        }
+        
+        # Prepare documents for reranking
+        documents = [chunk['content'] for chunk in chunks]
+        
+        data = {
+            "model": "jina-reranker-v2-base-multilingual",
+            "query": query,
+            "top_n": min(top_n, len(documents)),
+            "documents": documents,
+            "return_documents": True
+        }
+        
+        response = requests.post(
+            'https://api.jina.ai/v1/rerank',
+            headers=headers,
+            json=data,
+            timeout=30,
+            verify=certifi.where()
+        )
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        # Map reranked results back to original chunks
+        reranked_chunks = []
+        for item in result.get('results', []):
+            original_index = item['index']
+            chunk = chunks[original_index].copy()
+            # Update similarity score with reranker score
+            chunk['rerank_score'] = item['relevance_score']
+            chunk['original_similarity'] = chunk['similarity']
+            chunk['similarity'] = item['relevance_score']
+            reranked_chunks.append(chunk)
+        
+        print(f"✅ Reranked {len(chunks)} chunks to top {len(reranked_chunks)}")
+        return reranked_chunks
+        
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Reranker API Error: {e}. Falling back to original ranking.")
+        return chunks[:top_n]
+    except Exception as e:
+        print(f"⚠️ Reranking Error: {e}. Falling back to original ranking.")
+        return chunks[:top_n]
+
 def generate_response_api(query: str, context_chunks: List[Dict], conversation_history: List[Dict]) -> str:
     """Generate response using external API"""
     
@@ -164,7 +229,7 @@ Context:
             headers=headers,
             json=payload,
             timeout=60,
-            verify=certifi.where()  # Use certifi's CA bundle
+            verify=certifi.where()
         )
         
         response.raise_for_status()
@@ -236,8 +301,9 @@ async def chat(request: ChatRequest):
         # Generate embedding for the query
         query_embedding = get_embedding(request.message)
         
-        # Search for similar chunks
-        similar_chunks = search_similar_chunks(query_embedding, top_k=3)
+        # Search for similar chunks (retrieve more candidates for reranking)
+        initial_k = 20 if USE_RERANKER else 3
+        similar_chunks = search_similar_chunks(query_embedding, top_k=initial_k)
         
         if not similar_chunks:
             return ChatResponse(
@@ -245,10 +311,16 @@ async def chat(request: ChatRequest):
                 sources=[]
             )
         
+        # Rerank chunks if reranker is enabled
+        if USE_RERANKER:
+            reranked_chunks = rerank_chunks(request.message, similar_chunks, top_n=3)
+        else:
+            reranked_chunks = similar_chunks[:3]
+        
         # Generate response
         response_text = generate_response(
             request.message,
-            similar_chunks,
+            reranked_chunks,
             request.conversation_history
         )
         
@@ -260,9 +332,11 @@ async def chat(request: ChatRequest):
                 "chunk_index": chunk['chunk_index'],
                 "total_chunks": chunk['total_chunks'],
                 "similarity": round(chunk['similarity'], 3),
+                "reranked": USE_RERANKER,
+                "original_similarity": round(chunk.get('original_similarity', chunk['similarity']), 3) if USE_RERANKER else None,
                 "preview": chunk['content'][:200] + "..." if len(chunk['content']) > 200 else chunk['content']
             }
-            for chunk in similar_chunks
+            for chunk in reranked_chunks
         ]
         
         return ChatResponse(response=response_text, sources=sources)
@@ -276,6 +350,8 @@ async def get_frontend():
     """Serve the frontend"""
     mode_badge = "API Mode" if USE_API else "Local Mode"
     mode_color = "#10b981" if USE_API else "#f59e0b"
+    reranker_badge = "🔄 Reranker ON" if USE_RERANKER else "Reranker OFF"
+    reranker_color = "#8b5cf6" if USE_RERANKER else "#6b7280"
     
     return f"""
     <!DOCTYPE html>
@@ -334,11 +410,27 @@ async def get_frontend():
                 margin-top: 5px;
             }}
             
+            .badges {{
+                display: flex;
+                gap: 10px;
+                flex-direction: column;
+                align-items: flex-end;
+            }}
+            
             .mode-badge {{
                 background: {mode_color};
                 padding: 8px 16px;
                 border-radius: 20px;
                 font-size: 13px;
+                font-weight: 600;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            }}
+            
+            .reranker-badge {{
+                background: {reranker_color};
+                padding: 6px 12px;
+                border-radius: 20px;
+                font-size: 11px;
                 font-weight: 600;
                 box-shadow: 0 2px 8px rgba(0,0,0,0.2);
             }}
@@ -428,6 +520,16 @@ async def get_frontend():
             .source-meta {{
                 color: #666;
                 font-size: 12px;
+            }}
+            
+            .rerank-badge {{
+                display: inline-block;
+                background: #8b5cf6;
+                color: white;
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-size: 10px;
+                margin-left: 5px;
             }}
             
             .source-preview {{
@@ -524,13 +626,16 @@ async def get_frontend():
                     <h1>🤖 RAG Chat Assistant</h1>
                     <p>Ask questions and get answers with cited sources</p>
                 </div>
-                <div class="mode-badge">{mode_badge}</div>
+                <div class="badges">
+                    <div class="mode-badge">{mode_badge}</div>
+                    <div class="reranker-badge">{reranker_badge}</div>
+                </div>
             </div>
             
             <div class="chat-container" id="chatContainer">
                 <div class="message assistant">
                     <div class="message-content">
-                        Hello! I'm your RAG-powered assistant running in <strong>{mode_badge}</strong>. Ask me anything and I'll search through the knowledge base to provide accurate answers with citations.
+                        Hello! I'm your RAG-powered assistant running in <strong>{mode_badge}</strong>{' with ' + ("{reranker_badge}" if USE_RERANKER else '') if USE_RERANKER else ''}. Ask me anything and I'll search through the knowledge base to provide accurate answers with citations.
                     </div>
                 </div>
             </div>
@@ -680,7 +785,8 @@ async def health_check():
         "status": "healthy",
         "mode": "api" if USE_API else "local",
         "chat_model": API_MODEL if USE_API else CHAT_MODEL,
-        "embed_model": EMBED_MODEL
+        "embed_model": EMBED_MODEL,
+        "reranker_enabled": USE_RERANKER
     }
 
 @app.get("/config")
@@ -690,9 +796,11 @@ async def get_config():
         "mode": "api" if USE_API else "local",
         "chat_model": API_MODEL if USE_API else CHAT_MODEL,
         "embed_model": EMBED_MODEL,
-        "api_configured": USE_API
+        "api_configured": USE_API,
+        "reranker_enabled": USE_RERANKER,
+        "reranker_model": "jina-reranker-v2-base-multilingual" if USE_RERANKER else None
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="10.10.1.117", port=8000)
+    uvicorn.run(app, host="10.10.1.117", port=1137)

@@ -13,9 +13,21 @@ from dotenv import load_dotenv
 import requests
 import certifi
 import urllib3
+from rank_bm25 import BM25Okapi
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
 
-# Suppress SSL warnings if needed (for testing only)
-# urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
 
 # Load environment variables
 load_dotenv()
@@ -34,7 +46,7 @@ app.add_middleware(
 # Database configuration
 DB_CONFIG = {
     "host": "localhost",
-    "database": "migrated",
+    "database": "json_embed",
     "user": "postgres",
     "password": "1234",
     "port": 5432
@@ -45,10 +57,18 @@ API_KEY = os.getenv("API_KEY", "").strip()
 BASE_URL = os.getenv("BASE_URL", "https://api.studio.nebius.com/v1/")
 API_MODEL = os.getenv("model", "moonshotai/Kimi-K2-Instruct")
 
+# Jina Reranker Configuration
+JINA_API_KEY = os.getenv("JINA", "").strip()
+USE_RERANKER = bool(JINA_API_KEY)
+
 # Local Ollama Models (fallback)
-#EMBED_MODEL = "qwen3-embedding:8b"
-EMBED_MODEL = "nomic-embed-text:latest"
+EMBED_MODEL = "qwen3-embedding:8b"
 CHAT_MODEL = "gemma3:4b"
+
+# Hybrid Search Configuration
+VECTOR_WEIGHT = 0.5  # Weight for vector search (0-1)
+BM25_WEIGHT = 0.5    # Weight for BM25 search (0-1)
+# Note: VECTOR_WEIGHT + BM25_WEIGHT should = 1.0
 
 # Determine which mode to use
 USE_API = bool(API_KEY)
@@ -58,6 +78,12 @@ if USE_API:
     print(f"   Using model: {API_MODEL}")
 else:
     print(f"   Using local models: {CHAT_MODEL} (chat), {EMBED_MODEL} (embeddings)")
+print(f"🔄 Reranker: {'ENABLED' if USE_RERANKER else 'DISABLED'}")
+print(f"🔍 Hybrid Search: Vector Weight={VECTOR_WEIGHT}, BM25 Weight={BM25_WEIGHT}")
+
+# Global BM25 index (will be loaded on startup)
+bm25_index = None
+corpus_chunks = []
 
 class ChatRequest(BaseModel):
     message: str
@@ -72,6 +98,50 @@ def get_db_connection():
     conn = psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
     return conn
 
+def tokenize_text(text: str) -> List[str]:
+    """Tokenize text for BM25"""
+    try:
+        tokens = word_tokenize(text.lower())
+        stop_words = set(stopwords.words('english'))
+        tokens = [token for token in tokens if token.isalnum() and token not in stop_words]
+        return tokens
+    except:
+        # Fallback to simple tokenization if NLTK fails
+        return text.lower().split()
+
+def load_bm25_index():
+    """Load all documents and create BM25 index"""
+    global bm25_index, corpus_chunks
+    
+    print("📚 Loading BM25 index...")
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    id,
+                    content,
+                    source,
+                    parent_id,
+                    chunk_index,
+                    total_chunks
+                FROM document_embeddings
+                ORDER BY id
+            """)
+            
+            results = cur.fetchall()
+            corpus_chunks = [dict(row) for row in results]
+            
+            # Tokenize all documents
+            tokenized_corpus = [tokenize_text(chunk['content']) for chunk in corpus_chunks]
+            
+            # Create BM25 index
+            bm25_index = BM25Okapi(tokenized_corpus)
+            
+            print(f"✅ BM25 index loaded with {len(corpus_chunks)} documents")
+    finally:
+        conn.close()
+
 def get_embedding(text: str) -> List[float]:
     """Generate embedding using Ollama (always local for embeddings)"""
     try:
@@ -81,8 +151,8 @@ def get_embedding(text: str) -> List[float]:
         print(f"Error generating embedding: {e}")
         raise HTTPException(status_code=500, detail="Error generating embedding")
 
-def search_similar_chunks(query_embedding: List[float], top_k: int = 3) -> List[Dict]:
-    """Search for similar chunks using cosine similarity"""
+def search_vector(query_embedding: List[float], top_k: int = 50) -> List[Dict]:
+    """Search for similar chunks using cosine similarity (vector search)"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -106,12 +176,186 @@ def search_similar_chunks(query_embedding: List[float], top_k: int = 3) -> List[
             chunks = []
             for row in results:
                 chunk = dict(row)
-                chunk['similarity'] = 1 - chunk['distance']
+                chunk['vector_score'] = 1 - chunk['distance']
+                chunk['distance'] = chunk['distance']
                 chunks.append(chunk)
             
             return chunks
     finally:
         conn.close()
+
+def search_bm25(query: str, top_k: int = 50) -> List[Dict]:
+    """Search using BM25 keyword matching"""
+    global bm25_index, corpus_chunks
+    
+    if bm25_index is None:
+        load_bm25_index()
+    
+    # Tokenize query
+    tokenized_query = tokenize_text(query)
+    
+    # Get BM25 scores
+    scores = bm25_index.get_scores(tokenized_query)
+    
+    # Get top-k indices
+    top_indices = np.argsort(scores)[::-1][:top_k]
+    
+    # Return chunks with scores
+    results = []
+    for idx in top_indices:
+        chunk = corpus_chunks[idx].copy()
+        chunk['bm25_score'] = float(scores[idx])
+        results.append(chunk)
+    
+    return results
+
+def normalize_scores(chunks: List[Dict], score_key: str) -> List[Dict]:
+    """Normalize scores to 0-1 range"""
+    if not chunks:
+        return chunks
+    
+    scores = [chunk[score_key] for chunk in chunks]
+    min_score = min(scores)
+    max_score = max(scores)
+    
+    if max_score - min_score == 0:
+        for chunk in chunks:
+            chunk[f'{score_key}_normalized'] = 1.0
+    else:
+        for chunk in chunks:
+            chunk[f'{score_key}_normalized'] = (chunk[score_key] - min_score) / (max_score - min_score)
+    
+    return chunks
+
+def hybrid_search(query: str, query_embedding: List[float], top_k: int = 50) -> List[Dict]:
+    """
+    Perform hybrid search combining vector and BM25 results
+    
+    Args:
+        query: The search query text
+        query_embedding: The embedding vector for the query
+        top_k: Number of candidates to retrieve from each method
+    
+    Returns:
+        Combined and ranked list of chunks
+    """
+    print(f"🔍 Performing hybrid search (Vector: {VECTOR_WEIGHT}, BM25: {BM25_WEIGHT})...")
+    
+    # Get results from both methods
+    vector_results = search_vector(query_embedding, top_k=top_k)
+    bm25_results = search_bm25(query, top_k=top_k)
+    
+    print(f"   Vector results: {len(vector_results)}")
+    print(f"   BM25 results: {len(bm25_results)}")
+    
+    # Normalize scores
+    vector_results = normalize_scores(vector_results, 'vector_score')
+    bm25_results = normalize_scores(bm25_results, 'bm25_score')
+    
+    # Combine results using a dictionary keyed by chunk ID
+    combined_results = {}
+    
+    # Add vector results
+    for chunk in vector_results:
+        chunk_id = chunk['id']
+        combined_results[chunk_id] = chunk.copy()
+        combined_results[chunk_id]['vector_score_normalized'] = chunk['vector_score_normalized']
+        combined_results[chunk_id]['has_vector'] = True
+        combined_results[chunk_id]['has_bm25'] = False
+    
+    # Add or update with BM25 results
+    for chunk in bm25_results:
+        chunk_id = chunk['id']
+        if chunk_id in combined_results:
+            combined_results[chunk_id]['bm25_score'] = chunk['bm25_score']
+            combined_results[chunk_id]['bm25_score_normalized'] = chunk['bm25_score_normalized']
+            combined_results[chunk_id]['has_bm25'] = True
+        else:
+            combined_results[chunk_id] = chunk.copy()
+            combined_results[chunk_id]['bm25_score_normalized'] = chunk['bm25_score_normalized']
+            combined_results[chunk_id]['has_vector'] = False
+            combined_results[chunk_id]['has_bm25'] = True
+            combined_results[chunk_id]['vector_score_normalized'] = 0.0
+    
+    # Calculate hybrid scores
+    for chunk_id, chunk in combined_results.items():
+        vector_score = chunk.get('vector_score_normalized', 0.0)
+        bm25_score = chunk.get('bm25_score_normalized', 0.0)
+        
+        # Weighted combination
+        chunk['hybrid_score'] = (VECTOR_WEIGHT * vector_score) + (BM25_WEIGHT * bm25_score)
+        chunk['similarity'] = chunk['hybrid_score']  # For compatibility with existing code
+    
+    # Sort by hybrid score
+    sorted_chunks = sorted(combined_results.values(), key=lambda x: x['hybrid_score'], reverse=True)
+    
+    print(f"   Combined results: {len(sorted_chunks)}")
+    
+    return sorted_chunks
+
+def rerank_chunks(query: str, chunks: List[Dict], top_n: int = 3) -> List[Dict]:
+    """
+    Rerank chunks using Jina AI reranker API
+    
+    Args:
+        query: The user's query
+        chunks: List of retrieved chunks
+        top_n: Number of top results to return after reranking
+    
+    Returns:
+        Reranked list of chunks
+    """
+    if not USE_RERANKER or not chunks:
+        return chunks[:top_n]
+    
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {JINA_API_KEY}"
+        }
+        
+        # Prepare documents for reranking
+        documents = [chunk['content'] for chunk in chunks]
+        
+        data = {
+            "model": "jina-reranker-v2-base-multilingual",
+            "query": query,
+            "top_n": min(top_n, len(documents)),
+            "documents": documents,
+            "return_documents": True
+        }
+        
+        response = requests.post(
+            'https://api.jina.ai/v1/rerank',
+            headers=headers,
+            json=data,
+            timeout=30,
+            verify=certifi.where()
+        )
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        # Map reranked results back to original chunks
+        reranked_chunks = []
+        for item in result.get('results', []):
+            original_index = item['index']
+            chunk = chunks[original_index].copy()
+            # Update similarity score with reranker score
+            chunk['rerank_score'] = item['relevance_score']
+            chunk['original_similarity'] = chunk['similarity']
+            chunk['similarity'] = item['relevance_score']
+            reranked_chunks.append(chunk)
+        
+        print(f"✅ Reranked {len(chunks)} chunks to top {len(reranked_chunks)}")
+        return reranked_chunks
+        
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Reranker API Error: {e}. Falling back to original ranking.")
+        return chunks[:top_n]
+    except Exception as e:
+        print(f"⚠️ Reranking Error: {e}. Falling back to original ranking.")
+        return chunks[:top_n]
 
 def generate_response_api(query: str, context_chunks: List[Dict], conversation_history: List[Dict]) -> str:
     """Generate response using external API"""
@@ -164,7 +408,7 @@ Context:
             headers=headers,
             json=payload,
             timeout=60,
-            verify=certifi.where()  # Use certifi's CA bundle
+            verify=certifi.where()
         )
         
         response.raise_for_status()
@@ -229,41 +473,59 @@ def generate_response(query: str, context_chunks: List[Dict], conversation_histo
     else:
         return generate_response_ollama(query, context_chunks, conversation_history)
 
+@app.on_event("startup")
+async def startup_event():
+    """Load BM25 index on startup"""
+    load_bm25_index()
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Main chat endpoint"""
+    """Main chat endpoint with hybrid search"""
     try:
         # Generate embedding for the query
         query_embedding = get_embedding(request.message)
         
-        # Search for similar chunks
-        similar_chunks = search_similar_chunks(query_embedding, top_k=3)
+        # Perform hybrid search (retrieve more candidates for reranking)
+        initial_k = 50 if USE_RERANKER else 20
+        hybrid_results = hybrid_search(request.message, query_embedding, top_k=initial_k)
         
-        if not similar_chunks:
+        if not hybrid_results:
             return ChatResponse(
                 response="I couldn't find any relevant information to answer your question.",
                 sources=[]
             )
         
+        # Rerank chunks if reranker is enabled
+        if USE_RERANKER:
+            reranked_chunks = rerank_chunks(request.message, hybrid_results, top_n=3)
+        else:
+            reranked_chunks = hybrid_results[:3]
+        
         # Generate response
         response_text = generate_response(
             request.message,
-            similar_chunks,
+            reranked_chunks,
             request.conversation_history
         )
         
         # Prepare sources for citation
-        sources = [
-            {
+        sources = []
+        for chunk in reranked_chunks:
+            source_info = {
                 "id": chunk['id'],
                 "source": chunk['source'],
                 "chunk_index": chunk['chunk_index'],
                 "total_chunks": chunk['total_chunks'],
                 "similarity": round(chunk['similarity'], 3),
+                "hybrid_score": round(chunk.get('hybrid_score', chunk['similarity']), 3),
+                "vector_score": round(chunk.get('vector_score', 0), 3) if chunk.get('has_vector') else None,
+                "bm25_score": round(chunk.get('bm25_score', 0), 3) if chunk.get('has_bm25') else None,
+                "reranked": USE_RERANKER,
+                "original_similarity": round(chunk.get('original_similarity', chunk['similarity']), 3) if USE_RERANKER else None,
+                "search_method": "hybrid",
                 "preview": chunk['content'][:200] + "..." if len(chunk['content']) > 200 else chunk['content']
             }
-            for chunk in similar_chunks
-        ]
+            sources.append(source_info)
         
         return ChatResponse(response=response_text, sources=sources)
     
@@ -276,6 +538,8 @@ async def get_frontend():
     """Serve the frontend"""
     mode_badge = "API Mode" if USE_API else "Local Mode"
     mode_color = "#10b981" if USE_API else "#f59e0b"
+    reranker_badge = "🔄 Reranker ON" if USE_RERANKER else "Reranker OFF"
+    reranker_color = "#8b5cf6" if USE_RERANKER else "#6b7280"
     
     return f"""
     <!DOCTYPE html>
@@ -283,7 +547,7 @@ async def get_frontend():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>RAG Chat App</title>
+        <title>RAG Chat App - Hybrid Search</title>
         <style>
             * {{
                 margin: 0;
@@ -334,11 +598,36 @@ async def get_frontend():
                 margin-top: 5px;
             }}
             
+            .badges {{
+                display: flex;
+                gap: 10px;
+                flex-direction: column;
+                align-items: flex-end;
+            }}
+            
             .mode-badge {{
                 background: {mode_color};
                 padding: 8px 16px;
                 border-radius: 20px;
                 font-size: 13px;
+                font-weight: 600;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            }}
+            
+            .reranker-badge {{
+                background: {reranker_color};
+                padding: 6px 12px;
+                border-radius: 20px;
+                font-size: 11px;
+                font-weight: 600;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            }}
+            
+            .hybrid-badge {{
+                background: #ec4899;
+                padding: 6px 12px;
+                border-radius: 20px;
+                font-size: 11px;
                 font-weight: 600;
                 box-shadow: 0 2px 8px rgba(0,0,0,0.2);
             }}
@@ -412,7 +701,7 @@ async def get_frontend():
             
             .source-item {{
                 background: white;
-                padding: 10px;
+                padding: 12px;
                 margin: 8px 0;
                 border-radius: 8px;
                 font-size: 13px;
@@ -428,13 +717,65 @@ async def get_frontend():
             .source-meta {{
                 color: #666;
                 font-size: 12px;
+                margin: 3px 0;
+            }}
+            
+            .source-scores {{
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+                margin-top: 8px;
+            }}
+            
+            .score-badge {{
+                display: inline-block;
+                padding: 4px 8px;
+                border-radius: 12px;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+            
+            .score-badge.hybrid {{
+                background: #fce7f3;
+                color: #ec4899;
+            }}
+            
+            .score-badge.vector {{
+                background: #dbeafe;
+                color: #3b82f6;
+            }}
+            
+            .score-badge.bm25 {{
+                background: #fef3c7;
+                color: #f59e0b;
+            }}
+            
+            .score-badge.rerank {{
+                background: #ede9fe;
+                color: #8b5cf6;
+            }}
+            
+            .source-link {{
+                margin-top: 5px;
+            }}
+            
+            .source-link a {{
+                color: #667eea;
+                text-decoration: none;
+                font-size: 12px;
+            }}
+            
+            .source-link a:hover {{
+                text-decoration: underline;
             }}
             
             .source-preview {{
-                margin-top: 5px;
+                margin-top: 8px;
                 color: #888;
                 font-size: 12px;
                 font-style: italic;
+                padding-top: 8px;
+                border-top: 1px solid #e1e8ed;
             }}
             
             .input-container {{
@@ -522,15 +863,20 @@ async def get_frontend():
             <div class="header">
                 <div class="header-content">
                     <h1>🤖 RAG Chat Assistant</h1>
-                    <p>Ask questions and get answers with cited sources</p>
+                    <p>Hybrid Search with Vector + BM25 + Reranking</p>
                 </div>
-                <div class="mode-badge">{mode_badge}</div>
+                <div class="badges">
+                    <div class="mode-badge">{mode_badge}</div>
+                    <div class="hybrid-badge">🔍 Hybrid Search</div>
+                    <div class="reranker-badge">{reranker_badge}</div>
+                </div>
             </div>
             
             <div class="chat-container" id="chatContainer">
                 <div class="message assistant">
                     <div class="message-content">
-                        Hello! I'm your RAG-powered assistant running in <strong>{mode_badge}</strong>. Ask me anything and I'll search through the knowledge base to provide accurate answers with citations.
+                        Hello! I'm your RAG-powered assistant with <strong>Hybrid Search</strong> (Vector + BM25){' and ' + reranker_badge if USE_RERANKER else ''}. 
+                        I combine semantic understanding with keyword matching to find the most relevant information for your questions. Ask me anything!
                     </div>
                 </div>
             </div>
@@ -619,20 +965,44 @@ async def get_frontend():
                 if (sources && sources.length > 0) {{
                     const sourcesDiv = document.createElement('div');
                     sourcesDiv.className = 'sources';
-                    sourcesDiv.innerHTML = '<div class="sources-title">📚 Sources</div>';
+                    sourcesDiv.innerHTML = '<div class="sources-title">📚 Sources (Hybrid Search Results)</div>';
                     
                     sources.forEach((source, index) => {{
                         const sourceItem = document.createElement('div');
                         sourceItem.className = 'source-item';
-
-                        const pdfFileName = source.source.replace('.md', '.pdf');
-                        const pdfPath = `http://10.10.1.117:8008/${{ pdfFileName}}`;
+                        
+                        const pdfFileName = source.source.replace('.json', '.pdf');
+                        const pdfPath = `http://10.10.1.117:8008/${{pdfFileName}}`;
+                        
+                        let scoresHtml = '<div class="source-scores">';
+                        
+                        // Hybrid score (always present)
+                        scoresHtml += `<span class="score-badge hybrid">Hybrid: ${{(source.hybrid_score * 100).toFixed(1)}}%</span>`;
+                        
+                        // Vector score (if available)
+                        if (source.vector_score !== null) {{
+                            scoresHtml += `<span class="score-badge vector">Vector: ${{(source.vector_score * 100).toFixed(1)}}%</span>`;
+                        }}
+                        
+                        // BM25 score (if available)
+                        if (source.bm25_score !== null) {{
+                            scoresHtml += `<span class="score-badge bm25">BM25: ${{source.bm25_score.toFixed(2)}}</span>`;
+                        }}
+                        
+                        // Rerank score (if reranking was used)
+                        if (source.reranked && source.original_similarity !== null) {{
+                            scoresHtml += `<span class="score-badge rerank">Rerank: ${{(source.similarity * 100).toFixed(1)}}%</span>`;
+                        }}
+                        
+                        scoresHtml += '</div>';
+                        
                         sourceItem.innerHTML = `
                             <div class="source-name">${{index + 1}}. ${{source.source}}</div>
                             <div class="source-link">
                                 <a href="${{pdfPath}}" target="_blank">📄 View PDF: ${{pdfFileName}}</a>
                             </div>
-                            <div class="source-meta">Chunk ${{source.chunk_index}}/${{source.total_chunks}} • Similarity: ${{(source.similarity * 100).toFixed(1)}}%</div>
+                            <div class="source-meta">Chunk ${{source.chunk_index}}/${{source.total_chunks}}</div>
+                            ${{scoresHtml}}
                             <div class="source-preview">${{source.preview}}</div>
                         `;
                         sourcesDiv.appendChild(sourceItem);
@@ -680,7 +1050,13 @@ async def health_check():
         "status": "healthy",
         "mode": "api" if USE_API else "local",
         "chat_model": API_MODEL if USE_API else CHAT_MODEL,
-        "embed_model": EMBED_MODEL
+        "embed_model": EMBED_MODEL,
+        "reranker_enabled": USE_RERANKER,
+        "hybrid_search": True,
+        "vector_weight": VECTOR_WEIGHT,
+        "bm25_weight": BM25_WEIGHT,
+        "bm25_index_loaded": bm25_index is not None,
+        "corpus_size": len(corpus_chunks)
     }
 
 @app.get("/config")
@@ -690,9 +1066,29 @@ async def get_config():
         "mode": "api" if USE_API else "local",
         "chat_model": API_MODEL if USE_API else CHAT_MODEL,
         "embed_model": EMBED_MODEL,
-        "api_configured": USE_API
+        "api_configured": USE_API,
+        "reranker_enabled": USE_RERANKER,
+        "reranker_model": "jina-reranker-v2-base-multilingual" if USE_RERANKER else None,
+        "hybrid_search": True,
+        "vector_weight": VECTOR_WEIGHT,
+        "bm25_weight": BM25_WEIGHT,
+        "bm25_index_status": "loaded" if bm25_index is not None else "not loaded",
+        "corpus_size": len(corpus_chunks)
     }
+
+@app.post("/reload-bm25")
+async def reload_bm25():
+    """Reload BM25 index (useful after adding new documents)"""
+    try:
+        load_bm25_index()
+        return {
+            "status": "success",
+            "message": "BM25 index reloaded successfully",
+            "corpus_size": len(corpus_chunks)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reloading BM25 index: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="10.10.1.117", port=8000)
+    uvicorn.run(app, host="10.10.1.117", port=1137)
