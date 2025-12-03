@@ -46,7 +46,7 @@ app.add_middleware(
 # Database configuration
 DB_CONFIG = {
     "host": "localhost",
-    "database": "json_embed",
+    "database": "migrated",
     "user": "postgres",
     "password": "1234",
     "port": 5432
@@ -62,7 +62,7 @@ JINA_API_KEY = os.getenv("JINA", "").strip()
 USE_RERANKER = bool(JINA_API_KEY)
 
 # Local Ollama Models (fallback)
-EMBED_MODEL = "qwen3-embedding:8b"
+EMBED_MODEL = "nomic-embed-text:latest"
 CHAT_MODEL = "gemma3:4b"
 
 # Hybrid Search Configuration
@@ -1243,7 +1243,7 @@ async def get_frontend():
                         const sourceItem = document.createElement('div');
                         sourceItem.className = 'source-item';
                         
-                        const pdfFileName = source.source.replace('.md', '.pdf');
+                        const pdfFileName = source.source.replace('.json', '.pdf');
                         const pdfPath = `http://10.10.1.117:8008/${{pdfFileName}}`;
                         
                         let scoresHtml = '<div class="source-scores">';

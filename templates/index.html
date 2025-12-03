@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>RAG Chat App - Hybrid Search with Date Filter</title>
+        <!-- <link rel="stylesheet" href="style.css">
+        <script src="script.js"></script> -->
+        <link rel="stylesheet" href="/static/style.css">
+        <script src="/static/script.js"></script>
+        <link rel="stylesheet" href="style.css">
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
+    </head>
+    <body>
+        <div class="container">
+            <div class="date-filter-section">
+                <div class="filter-group">
+                    <label for="startDate">Start Date:</label>
+                    <input type="date" id="startDate">
+                </div>
+                <div class="filter-group">
+                    <label for="endDate">End Date:</label>
+                    <input type="date" id="endDate">
+                </div>
+                <button class="filter-btn" onclick="applyDateFilter()">🔍 Apply Filter</button>
+                <button class="filter-btn" onclick="clearDateFilter()" style="background: #6b7280">Clear</button>
+                <div id="filterInfo"></div>
+            </div>
+            
+            <div class="main-content">
+                <div class="chat-container">
+                    <div class="messages" id="chatContainer">
+                        <div class="message assistant">
+                            <div class="message-content">
+                                Hello! I'm your RAG-powered assistant with <strong>Date Filter</strong> and <strong>Hybrid Search</strong>. 
+                                Use the date filters above to narrow down the documents to search from. Ask me anything!
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="input-container">
+                        <input 
+                            type="text" 
+                            id="messageInput" 
+                            placeholder="Type your question here..."
+                            onkeypress="if(event.key === 'Enter') sendMessage()"
+                        >
+                        <button id="sendButton" onclick="sendMessage()">Send</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        
+    </body>
+    </html>

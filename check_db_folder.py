@@ -10,7 +10,7 @@ DB_CONFIG = {
     "password": "1234",
     "port": 5432
 }
-
+    
 
 # Folder path
 RESULTS_FOLDER = './results'

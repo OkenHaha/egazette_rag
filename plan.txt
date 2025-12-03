@@ -1,0 +1,5 @@
+- match file name with serialno i.e. serial == parent_id
+- fetch publication date, notification date,  gazette id from matching filename and serial no.
+- create a filter to short the documents
+- match date with file name (chunk) from vector db and perform rag
+- return results after filteration
